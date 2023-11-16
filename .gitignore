@@ -8,3 +8,5 @@ Makefile
 /build-*/
 /install-newlib-nano/
 /stamps/
+
+private
