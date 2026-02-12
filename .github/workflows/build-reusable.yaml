@@ -10,6 +10,10 @@ on:
         description: "OS list"
         type: string
         default: '["ubuntu-22.04","ubuntu-24.04"]'
+      container-image:
+        description: "Container image for build job"
+        type: string
+        default: 'rockylinux:8.9.20231119'
       mode:
         description: "Mode list"
         type: string
@@ -71,6 +75,7 @@ jobs:
         run: |
           echo "Artifact name:  ${{ inputs.artifact-name }}"
           echo "OS list:        ${{ inputs.os }}"
+          echo "Container image:${{ inputs.container-image }}"
           echo "Mode list:      ${{ inputs.mode }}"
           echo "Target list:    ${{ inputs.target }}"
           echo "Compiler list:  ${{ inputs.compiler }}"
@@ -125,6 +130,8 @@ jobs:
 
   build:
     runs-on: ${{ matrix.os }}
+    container:
+      image: ${{ inputs.container-image }}
     needs: [submodule_cache,validate_inputs]
     env:
       smcache_key: ${{ needs.submodule_cache.outputs.key }}
@@ -150,13 +157,29 @@ jobs:
     outputs:
       toolchain-name: ${{ steps.toolchain-name-generator.outputs.TOOLCHAIN_NAME }}
     steps:
+      - name: bootstrap tools for checkout in container
+        if: ${{ inputs.container-image != '' }}
+        run: |
+          if ! command -v git >/dev/null 2>&1; then
+            if command -v dnf >/dev/null 2>&1; then
+              dnf -y install git tar gzip
+            else
+              yum -y install git tar gzip
+            fi
+          fi
       - uses: actions/checkout@v4
 
-      - name: Remove unneeded frameworks to recover disk space
-        run: sudo ./.github/cleanup-rootfs.sh
+      - name: mark workspace as git safe directory
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: install dependencies
-        run: sudo ./.github/setup-apt.sh
+        run: |
+          if [ -n "${{ inputs.container-image }}" ]; then
+            bash ./.github/setup-yum.sh
+          else
+            sudo ./.github/setup-apt.sh
+          fi
 
       - name: Load submodule cache
         uses: actions/cache/restore@v4
@@ -166,6 +189,8 @@ jobs:
 
       - name: build toolchain
         run: |
+          git rev-parse --is-inside-work-tree
+
           TARGET_TUPLE=($(echo ${{ matrix.target }} | tr "-" "\n"))
           BUILD_TOOLCHAIN="./configure --prefix=/mnt/riscv --with-arch=${TARGET_TUPLE[0]} --with-abi=${TARGET_TUPLE[1]}"
           ARGS=""
@@ -185,8 +210,9 @@ jobs:
             ARGS="$ARGS --enable-strip"
           fi
           $BUILD_TOOLCHAIN $ARGS
-          sudo mkdir /mnt/riscv
-          sudo chown runner:runner /mnt/riscv
+          mkdir -p /mnt/riscv
+          chown "$(id -un):$(id -gn)" /mnt/riscv || true
+          export GIT_DISCOVERY_ACROSS_FILESYSTEM=1
           make -j $(nproc) ${{ matrix.mode }}
       - name: build simulator
         if: |
@@ -220,7 +246,12 @@ jobs:
           if [ -n "$ARTIFACT_NAME" ]; then
             ARTIFACT_NAME="-${ARTIFACT_NAME}"
           fi
-          BASE_NAME="riscv$BITS-$MODE-${{ matrix.os }}-${{ matrix.compiler }}"
+          if [ -n "${{ inputs.container-image }}" ]; then
+            DISTRO_NAME=$(echo "${{ inputs.container-image }}" | sed 's/[:\/]/-/g')
+          else
+            DISTRO_NAME="${{ matrix.os }}"
+          fi
+          BASE_NAME="riscv$BITS-$MODE-${DISTRO_NAME}-${{ matrix.compiler }}"
           echo "TOOLCHAIN_NAME=${BASE_NAME}${ARTIFACT_NAME}" >> $GITHUB_OUTPUT
           echo "TOOLCHAIN_NAME_STRIPPED=${BASE_NAME}-stripped${ARTIFACT_NAME}" >> $GITHUB_OUTPUT
       - name: tarball build unstripped
